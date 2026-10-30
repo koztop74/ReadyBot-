@@ -1,0 +1,1024 @@
+/*
+  READYBOT - Bruce-inspired monochrome interface (compile fixes)
+  Target: ESP32-C3 Super Mini + SSD1306 OLED 128x64 I2C
+
+  Confirmed wiring:
+    OLED SDA -> GPIO 9
+    OLED SCL -> GPIO 10
+    Button  -> GPIO 1 and GND (INPUT_PULLUP)
+
+  Libraries:
+    - Adafruit GFX Library
+    - Adafruit SSD1306
+    - ESP32 board package (WiFi and BLE are included)
+
+  No clock screen, no battery estimate, no weather, no web server.
+  Wi-Fi/BLE are started only when their scanner is selected.
+  Wireless features are passive scanners only.
+*/
+
+#include <Arduino.h>
+#include <math.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <Preferences.h>
+#include <esp_system.h>
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <Adafruit_GFX.h>
+
+// Adafruit_GFX defines a swap macro in some releases. Undefining it here
+// prevents it from breaking standard-library headers included afterwards.
+#ifdef swap
+  #undef swap
+#endif
+
+#include <Adafruit_SSD1306.h>
+
+// ------------------------- HARDWARE ---------------------------------
+static const uint8_t OLED_SDA = 10;
+static const uint8_t OLED_SCL = 9;
+static const uint8_t BUTTON_PIN = 1;
+static const uint8_t OLED_ADDRESS = 0x3C;
+static const int SCREEN_WIDTH = 128;
+static const int SCREEN_HEIGHT = 64;
+static const uint32_t DEBOUNCE_MS = 35;
+static const uint32_t HOLD_MS = 650;
+static const uint32_t VERY_LONG_HOLD_MS = 1600;
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Preferences prefs;
+
+// ------------------------- APP STATE --------------------------------
+enum ScreenId : uint8_t {
+  SCR_HOME,
+  SCR_WIFI_LIST,
+  SCR_BLE_LIST,
+  SCR_CHANNEL_MAP,
+  SCR_REACTION,
+  SCR_DICE,
+  SCR_COUNTER,
+  SCR_PIXEL_LAB,
+  SCR_FACE,
+  SCR_SYSTEM,
+  SCR_OLED_TEST,
+  SCR_SETTINGS,
+  SCR_ABOUT
+};
+
+struct MenuItem {
+  const char *name;
+  uint8_t icon;
+  ScreenId screen;
+};
+
+// Icon ids are drawn locally with Adafruit_GFX primitives.
+enum IconId : uint8_t {
+  ICON_WIFI,
+  ICON_BLE,
+  ICON_CHANNELS,
+  ICON_REACTION,
+  ICON_DICE,
+  ICON_COUNTER,
+  ICON_PIXEL,
+  ICON_FACE,
+  ICON_SYSTEM,
+  ICON_DISPLAY,
+  ICON_SETTINGS,
+  ICON_ABOUT
+};
+
+MenuItem menuItems[] = {
+  {"WiFi Scan",    ICON_WIFI,     SCR_WIFI_LIST},
+  {"BLE Radar",    ICON_BLE,      SCR_BLE_LIST},
+  {"Channel Map",  ICON_CHANNELS, SCR_CHANNEL_MAP},
+  {"Reaction",     ICON_REACTION, SCR_REACTION},
+  {"Dice",         ICON_DICE,     SCR_DICE},
+  {"Counter",      ICON_COUNTER,  SCR_COUNTER},
+  {"Pixel Lab",    ICON_PIXEL,    SCR_PIXEL_LAB},
+  {"Robot Face",   ICON_FACE,     SCR_FACE},
+  {"System Info",  ICON_SYSTEM,   SCR_SYSTEM},
+  {"OLED Test",    ICON_DISPLAY,  SCR_OLED_TEST},
+  {"Settings",     ICON_SETTINGS, SCR_SETTINGS},
+  {"About",        ICON_ABOUT,    SCR_ABOUT}
+};
+static const uint8_t MENU_COUNT = sizeof(menuItems) / sizeof(menuItems[0]);
+static const uint8_t MAX_WIFI = 12;
+static const uint8_t MAX_BLE = 10;
+
+ScreenId currentScreen = SCR_HOME;
+uint8_t menuIndex = 0;
+uint8_t settingsIndex = 0;
+uint8_t systemPage = 0;
+uint8_t oledTestPattern = 0;
+uint8_t pixelMode = 0;
+uint8_t faceMood = 0;
+uint8_t diceA = 1;
+uint8_t diceB = 6;
+uint32_t counterValue = 0;
+bool invertMode = false;
+bool rotateMode = false;
+bool counterDirty = false;
+
+// Button state machine.
+bool buttonWasDown = false;
+bool buttonEventPending = false;
+uint32_t buttonDownAt = 0;
+uint32_t buttonChangedAt = 0;
+
+// Wi-Fi scan cache.
+char wifiNames[MAX_WIFI][33];
+int16_t wifiRssi[MAX_WIFI];
+uint8_t wifiChannel[MAX_WIFI];
+bool wifiOpen[MAX_WIFI];
+uint8_t wifiCount = 0;
+uint16_t wifiTotalFound = 0;
+uint8_t wifiSelected = 0;
+uint8_t channelCounts[14];
+
+// BLE scan cache.
+String bleNames[MAX_BLE];
+String bleAddresses[MAX_BLE];
+int16_t bleRssi[MAX_BLE];
+uint8_t bleCount = 0;
+uint16_t bleTotalFound = 0;
+uint8_t bleSelected = 0;
+
+// Reaction mini-game. millis() is used internally only; no clock UI exists.
+enum ReactionState : uint8_t { REACT_READY, REACT_WAITING, REACT_GO, REACT_RESULT, REACT_FALSE_START };
+ReactionState reactionState = REACT_READY;
+uint32_t reactionStartedAt = 0;
+uint32_t reactionDelay = 0;
+uint32_t reactionMs = 0;
+
+// Animation pacing.
+uint32_t lastAnimationAt = 0;
+uint32_t animationFrame = 0;
+uint32_t nextBlinkAt = 0;
+uint32_t blinkUntil = 0;
+
+// Forward declarations used before their definitions.
+void drawWiFiDetails();
+void drawChannelMap();
+void drawBLEDetails();
+
+// ------------------------- SMALL HELPERS ----------------------------
+void centeredText(const String &text, int16_t y, uint8_t size = 1) {
+  // Use the built-in 5x7 font metrics (6 pixels per character including spacing).
+  // This deliberately avoids getTextBounds(), so it also works with older or
+  // vendor-modified Adafruit_GFX/SSD1306 library installations.
+  display.setTextSize(size);
+  int32_t textWidth = (int32_t)text.length() * 6L * size;
+  int16_t x = (int16_t)((SCREEN_WIDTH - textWidth) / 2);
+  if (x < 0) x = 0;
+  display.setCursor(x, y);
+  display.print(text);
+}
+
+String clipped(const String &value, uint8_t maxChars) {
+  if (value.length() <= maxChars) return value;
+  if (maxChars < 4) return value.substring(0, maxChars);
+  return value.substring(0, maxChars - 3) + "...";
+}
+
+void startFrame(const String &title, const String &right = "") {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(4, 1);
+  display.print(clipped(title, 15));
+  if (right.length()) {
+    int x = 124 - (int)right.length() * 6;
+    if (x < 82) x = 82;
+    display.setCursor(x, 1);
+    display.print(right);
+  }
+  display.drawLine(3, 10, 124, 10, SSD1306_WHITE);
+}
+
+void footer(const char *text = "TAP NEXT  HOLD BACK") {
+  display.drawLine(3, 53, 124, 53, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(4, 56);
+  display.print(text);
+}
+
+void present() {
+  display.display();
+}
+
+void showMessage(const String &title, const String &line1, const String &line2 = "") {
+  startFrame(title);
+  centeredText(line1, 22);
+  if (line2.length()) centeredText(line2, 34);
+  footer("PLEASE WAIT...");
+  present();
+}
+
+void saveCounter() {
+  if (counterDirty) {
+    prefs.putUInt("counter", counterValue);
+    counterDirty = false;
+  }
+}
+
+void applyDisplaySettings() {
+  display.setRotation(rotateMode ? 2 : 0);
+  display.invertDisplay(invertMode);
+}
+
+// ------------------------- BRUCE-INSPIRED ICONS ----------------------
+void drawIcon(uint8_t icon, int16_t cx, int16_t cy) {
+  // Keep the artwork bold and legible on a 128x64 one-colour OLED.
+  switch (icon) {
+    case ICON_WIFI:
+      display.drawLine(cx - 15, cy - 3, cx, cy - 14, SSD1306_WHITE);
+      display.drawLine(cx, cy - 14, cx + 15, cy - 3, SSD1306_WHITE);
+      display.drawLine(cx - 10, cy + 1, cx, cy - 7, SSD1306_WHITE);
+      display.drawLine(cx, cy - 7, cx + 10, cy + 1, SSD1306_WHITE);
+      display.drawLine(cx - 5, cy + 5, cx, cy + 1, SSD1306_WHITE);
+      display.drawLine(cx, cy + 1, cx + 5, cy + 5, SSD1306_WHITE);
+      display.fillCircle(cx, cy + 9, 2, SSD1306_WHITE);
+      break;
+    case ICON_BLE:
+      display.drawLine(cx, cy - 15, cx, cy + 15, SSD1306_WHITE);
+      display.drawLine(cx, cy - 15, cx + 10, cy - 6, SSD1306_WHITE);
+      display.drawLine(cx + 10, cy - 6, cx - 8, cy + 8, SSD1306_WHITE);
+      display.drawLine(cx - 8, cy - 6, cx + 10, cy + 8, SSD1306_WHITE);
+      display.drawLine(cx + 10, cy + 8, cx, cy + 15, SSD1306_WHITE);
+      display.drawLine(cx - 13, cy - 9, cx + 13, cy + 11, SSD1306_WHITE);
+      display.drawLine(cx - 13, cy + 9, cx + 13, cy - 11, SSD1306_WHITE);
+      break;
+    case ICON_CHANNELS:
+      display.drawLine(cx - 17, cy + 12, cx + 17, cy + 12, SSD1306_WHITE);
+      display.fillRect(cx - 14, cy + 2, 5, 10, SSD1306_WHITE);
+      display.fillRect(cx - 6, cy - 5, 5, 17, SSD1306_WHITE);
+      display.fillRect(cx + 2, cy - 12, 5, 24, SSD1306_WHITE);
+      display.fillRect(cx + 10, cy - 1, 5, 13, SSD1306_WHITE);
+      break;
+    case ICON_REACTION:
+      display.drawCircle(cx, cy, 12, SSD1306_WHITE);
+      display.drawLine(cx, cy, cx + 7, cy - 7, SSD1306_WHITE);
+      display.drawLine(cx, cy, cx, cy - 8, SSD1306_WHITE);
+      display.fillCircle(cx, cy, 2, SSD1306_WHITE);
+      display.drawLine(cx - 4, cy - 16, cx + 4, cy - 16, SSD1306_WHITE);
+      break;
+    case ICON_DICE:
+      display.drawRoundRect(cx - 15, cy - 13, 30, 26, 4, SSD1306_WHITE);
+      display.fillCircle(cx - 8, cy - 6, 2, SSD1306_WHITE);
+      display.fillCircle(cx + 8, cy + 6, 2, SSD1306_WHITE);
+      display.fillCircle(cx, cy, 2, SSD1306_WHITE);
+      break;
+    case ICON_COUNTER:
+      display.setTextSize(2);
+      display.setCursor(cx - 12, cy - 10);
+      display.print("#");
+      display.setTextSize(1);
+      display.drawLine(cx - 17, cy + 13, cx + 17, cy + 13, SSD1306_WHITE);
+      break;
+    case ICON_PIXEL:
+      display.fillRect(cx - 14, cy - 12, 7, 7, SSD1306_WHITE);
+      display.fillRect(cx - 3, cy - 12, 7, 7, SSD1306_WHITE);
+      display.drawRect(cx + 8, cy - 12, 7, 7, SSD1306_WHITE);
+      display.drawRect(cx - 14, cy - 1, 7, 7, SSD1306_WHITE);
+      display.fillRect(cx - 3, cy - 1, 7, 7, SSD1306_WHITE);
+      display.drawRect(cx + 8, cy - 1, 7, 7, SSD1306_WHITE);
+      display.fillRect(cx - 14, cy + 10, 7, 7, SSD1306_WHITE);
+      display.drawRect(cx - 3, cy + 10, 7, 7, SSD1306_WHITE);
+      display.fillRect(cx + 8, cy + 10, 7, 7, SSD1306_WHITE);
+      break;
+    case ICON_FACE:
+      display.drawRoundRect(cx - 17, cy - 15, 34, 30, 8, SSD1306_WHITE);
+      display.fillRoundRect(cx - 10, cy - 5, 6, 8, 2, SSD1306_WHITE);
+      display.fillRoundRect(cx + 4, cy - 5, 6, 8, 2, SSD1306_WHITE);
+      display.drawLine(cx - 8, cy + 8, cx + 8, cy + 8, SSD1306_WHITE);
+      break;
+    case ICON_SYSTEM:
+      display.drawRoundRect(cx - 10, cy - 10, 20, 20, 2, SSD1306_WHITE);
+      display.drawRect(cx - 5, cy - 5, 10, 10, SSD1306_WHITE);
+      for (int8_t i = -7; i <= 7; i += 7) {
+        display.drawLine(cx + i, cy - 15, cx + i, cy - 10, SSD1306_WHITE);
+        display.drawLine(cx + i, cy + 10, cx + i, cy + 15, SSD1306_WHITE);
+        display.drawLine(cx - 15, cy + i, cx - 10, cy + i, SSD1306_WHITE);
+        display.drawLine(cx + 10, cy + i, cx + 15, cy + i, SSD1306_WHITE);
+      }
+      break;
+    case ICON_DISPLAY:
+      display.drawRoundRect(cx - 17, cy - 12, 34, 24, 3, SSD1306_WHITE);
+      display.drawLine(cx - 11, cy - 5, cx - 3, cy - 5, SSD1306_WHITE);
+      display.drawLine(cx - 11, cy, cx + 7, cy, SSD1306_WHITE);
+      display.drawLine(cx - 11, cy + 5, cx + 11, cy + 5, SSD1306_WHITE);
+      break;
+    case ICON_SETTINGS:
+      display.drawCircle(cx, cy, 10, SSD1306_WHITE);
+      display.drawCircle(cx, cy, 4, SSD1306_WHITE);
+      for (uint8_t i = 0; i < 8; i++) {
+        float a = i * 0.785398f;
+        int x1 = cx + (int)(9 * cosf(a));
+        int y1 = cy + (int)(9 * sinf(a));
+        int x2 = cx + (int)(13 * cosf(a));
+        int y2 = cy + (int)(13 * sinf(a));
+        display.drawLine(x1, y1, x2, y2, SSD1306_WHITE);
+      }
+      break;
+    case ICON_ABOUT:
+      display.drawCircle(cx, cy, 14, SSD1306_WHITE);
+      display.setTextSize(2);
+      display.setCursor(cx - 4, cy - 8);
+      display.print("R");
+      display.setTextSize(1);
+      break;
+  }
+}
+
+void drawHome() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(5, 1);
+  display.print("READYBOT");
+  char page[8];
+  snprintf(page, sizeof(page), "%02u/%02u", (unsigned)(menuIndex + 1), (unsigned)MENU_COUNT);
+  display.setCursor(91, 1);
+  display.print(page);
+  display.drawLine(3, 10, 124, 10, SSD1306_WHITE);
+
+  display.drawRoundRect(4, 12, 120, 39, 4, SSD1306_WHITE);
+  display.drawLine(12, 26, 18, 20, SSD1306_WHITE);
+  display.drawLine(12, 26, 18, 32, SSD1306_WHITE);
+  display.drawLine(116, 26, 110, 20, SSD1306_WHITE);
+  display.drawLine(116, 26, 110, 32, SSD1306_WHITE);
+  drawIcon(menuItems[menuIndex].icon, 64, 25);
+  centeredText(menuItems[menuIndex].name, 41, 1);
+
+  display.drawLine(3, 53, 124, 53, SSD1306_WHITE);
+  display.setCursor(4, 56);
+  display.print("TAP NEXT  HOLD OPEN");
+  present();
+}
+
+void goHome() {
+  if (currentScreen == SCR_COUNTER) saveCounter();
+  currentScreen = SCR_HOME;
+  reactionState = REACT_READY;
+  drawHome();
+}
+
+// ------------------------- WI-FI TOOLS -------------------------------
+void turnWiFiOff() {
+  WiFi.disconnect(false, false);
+  WiFi.scanDelete();
+  WiFi.mode(WIFI_OFF);
+}
+
+void runWiFiScan(bool forChannelMap) {
+  // Do not leave Bluetooth active while changing radio mode.
+  showMessage(forChannelMap ? "CHANNEL MAP" : "WIFI SCAN", "Scanning 2.4 GHz...", "Passive discovery");
+  turnWiFiOff();
+  delay(80);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, false);
+  delay(80);
+
+  int n = WiFi.scanNetworks(false, true, true, 250);
+  wifiCount = 0;
+  wifiTotalFound = 0;
+  memset(channelCounts, 0, sizeof(channelCounts));
+
+  if (n > 0) {
+    wifiTotalFound = (uint16_t)n;
+    for (int i = 0; i < n; i++) {
+      int ch = WiFi.channel(i);
+      if (ch >= 1 && ch <= 13 && channelCounts[ch] < 255) channelCounts[ch]++;
+      if (wifiCount < MAX_WIFI) {
+        WiFi.SSID(i).toCharArray(wifiNames[wifiCount], sizeof(wifiNames[wifiCount]));
+        wifiRssi[wifiCount] = WiFi.RSSI(i);
+        wifiChannel[wifiCount] = (uint8_t)ch;
+        wifiOpen[wifiCount] = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+        wifiCount++;
+      }
+    }
+  }
+  WiFi.scanDelete();
+  WiFi.disconnect(false, false);
+  WiFi.mode(WIFI_OFF);
+  wifiSelected = 0;
+  currentScreen = forChannelMap ? SCR_CHANNEL_MAP : SCR_WIFI_LIST;
+  if (forChannelMap) drawChannelMap(); else drawWiFiDetails();
+}
+
+void drawWiFiDetails() {
+  char right[10];
+  snprintf(right, sizeof(right), "%02u/%02u", (unsigned)(wifiCount ? wifiSelected + 1 : 0), (unsigned)wifiCount);
+  startFrame("WIFI SCAN", right);
+  if (!wifiCount) {
+    centeredText("No networks found", 23);
+    centeredText("Try scanning again", 35);
+    footer("TAP RESCAN  HOLD BACK");
+    present();
+    return;
+  }
+  display.drawRoundRect(4, 13, 120, 15, 2, SSD1306_WHITE);
+  display.setCursor(8, 17);
+  String ssid = strlen(wifiNames[wifiSelected]) ? String(wifiNames[wifiSelected]) : String("<hidden network>");
+  display.print(clipped(ssid, 18));
+  display.setCursor(7, 32);
+  display.print("RSSI "); display.print(wifiRssi[wifiSelected]); display.print(" dBm");
+  display.setCursor(7, 42);
+  display.print("CH "); display.print(wifiChannel[wifiSelected]);
+  display.print("  "); display.print(wifiOpen[wifiSelected] ? "OPEN" : "LOCKED");
+  footer("TAP NEXT  HOLD BACK");
+  present();
+}
+
+void drawChannelMap() {
+  char label[20];
+  snprintf(label, sizeof(label), "CHANNEL MAP  AP:%u", (unsigned)wifiTotalFound);
+  startFrame(label);
+  uint8_t maxCount = 0;
+  for (uint8_t ch = 1; ch <= 13; ch++) if (channelCounts[ch] > maxCount) maxCount = channelCounts[ch];
+  if (!wifiTotalFound) {
+    centeredText("No 2.4 GHz APs", 25);
+    centeredText("found nearby", 36);
+  } else {
+    const int baseY = 43;
+    display.drawLine(5, baseY, 123, baseY, SSD1306_WHITE);
+    for (uint8_t ch = 1; ch <= 13; ch++) {
+      int x = 7 + (ch - 1) * 9;
+      int height = maxCount ? (int)((channelCounts[ch] * 25UL) / maxCount) : 0;
+      if (channelCounts[ch] && height < 2) height = 2;
+      if (height > 25) height = 25;
+      if (height > 0) display.fillRect(x, baseY - height, 5, height, SSD1306_WHITE);
+      char digit[3]; snprintf(digit, sizeof(digit), "%u", ch);
+      display.setCursor(x - (ch >= 10 ? 1 : 0), 44);
+      display.print(digit);
+    }
+    display.setCursor(5, 12);
+    display.print("APs per channel");
+  }
+  footer("TAP RESCAN  HOLD BACK");
+  present();
+}
+
+// ------------------------- BLE TOOLS ---------------------------------
+void runBLEScan() {
+  showMessage("BLE RADAR", "Scanning BLE...", "Radio on temporarily");
+  turnWiFiOff();
+  bleCount = 0;
+  bleTotalFound = 0;
+
+  BLEDevice::init("");
+  BLEScan *scanner = BLEDevice::getScan();
+  if (scanner != nullptr) {
+    scanner->setActiveScan(false); // passive scan: do not request extra data
+    scanner->setInterval(100);
+    scanner->setWindow(80);
+    BLEScanResults *results = scanner->start(4, false);
+    if (results != nullptr) {
+      int count = (int)results->getCount();
+      bleTotalFound = (uint16_t)count;
+      for (int i = 0; i < count && bleCount < MAX_BLE; i++) {
+        BLEAdvertisedDevice dev = results->getDevice(i);
+        String name = dev.haveName() ? dev.getName() : String("Unknown device");
+        String address = dev.getAddress().toString().c_str();
+        bleNames[bleCount] = clipped(name, 25);
+        bleAddresses[bleCount] = address;
+        bleRssi[bleCount] = dev.getRSSI();
+        bleCount++;
+      }
+    }
+    scanner->clearResults();
+  }
+  BLEDevice::deinit(true);
+  bleSelected = 0;
+  currentScreen = SCR_BLE_LIST;
+  drawBLEDetails();
+}
+
+void drawBLEDetails() {
+  char right[10];
+  snprintf(right, sizeof(right), "%02u/%02u", (unsigned)(bleCount ? bleSelected + 1 : 0), (unsigned)bleCount);
+  startFrame("BLE RADAR", right);
+  if (!bleCount) {
+    centeredText("No BLE devices", 23);
+    centeredText("detected nearby", 35);
+    footer("TAP RESCAN  HOLD BACK");
+    present();
+    return;
+  }
+  display.drawRoundRect(4, 13, 120, 15, 2, SSD1306_WHITE);
+  display.setCursor(8, 17);
+  display.print(clipped(bleNames[bleSelected], 18));
+  display.setCursor(7, 32);
+  display.print("RSSI "); display.print(bleRssi[bleSelected]); display.print(" dBm");
+  display.setCursor(7, 42);
+  display.print(clipped(bleAddresses[bleSelected], 19));
+  footer("TAP NEXT  HOLD BACK");
+  present();
+}
+
+// ------------------------- REACTION GAME -----------------------------
+void drawReaction() {
+  startFrame("REACTION TEST");
+  switch (reactionState) {
+    case REACT_READY:
+      centeredText("READY?", 20, 2);
+      centeredText("Tap to start", 40);
+      break;
+    case REACT_WAITING:
+      centeredText("WAIT...", 24, 2);
+      centeredText("Don't press yet", 42);
+      break;
+    case REACT_GO:
+      display.fillRoundRect(25, 16, 78, 31, 5, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      centeredText("GO!", 23, 2);
+      display.setTextColor(SSD1306_WHITE);
+      break;
+    case REACT_RESULT:
+      centeredText("YOUR REACTION", 16);
+      centeredText(String(reactionMs) + " ms", 28, 2);
+      centeredText(reactionMs < 220 ? "Super fast!" : reactionMs < 350 ? "Nice result" : "Try again", 44);
+      break;
+    case REACT_FALSE_START:
+      centeredText("FALSE START!", 24, 2);
+      centeredText("Wait for GO", 43);
+      break;
+  }
+  footer("TAP ACTION  HOLD BACK");
+  present();
+}
+
+void startReaction() {
+  reactionState = REACT_WAITING;
+  reactionStartedAt = millis();
+  reactionDelay = 1200 + (esp_random() % 3000);
+  drawReaction();
+}
+
+void handleReactionTap() {
+  if (reactionState == REACT_READY || reactionState == REACT_RESULT || reactionState == REACT_FALSE_START) {
+    startReaction();
+  } else if (reactionState == REACT_WAITING) {
+    // Avoid a false start if the GO edge happened just before this button event.
+    uint32_t elapsed = millis() - reactionStartedAt;
+    if (elapsed >= reactionDelay) {
+      reactionMs = elapsed - reactionDelay;
+      reactionState = REACT_RESULT;
+    } else {
+      reactionState = REACT_FALSE_START;
+    }
+    drawReaction();
+  } else if (reactionState == REACT_GO) {
+    reactionMs = millis() - reactionStartedAt - reactionDelay;
+    reactionState = REACT_RESULT;
+    drawReaction();
+  }
+}
+
+// ------------------------- DICE / COUNTER ----------------------------
+void drawDice(int16_t x, int16_t y, uint8_t value) {
+  display.drawRoundRect(x, y, 30, 30, 4, SSD1306_WHITE);
+  const int16_t p[6][2] = {
+    {(int16_t)(x + 7),  (int16_t)(y + 7)},
+    {(int16_t)(x + 15), (int16_t)(y + 7)},
+    {(int16_t)(x + 23), (int16_t)(y + 7)},
+    {(int16_t)(x + 7),  (int16_t)(y + 23)},
+    {(int16_t)(x + 15), (int16_t)(y + 23)},
+    {(int16_t)(x + 23), (int16_t)(y + 23)}
+  };
+  if (value == 1) display.fillCircle(x + 15, y + 15, 2, SSD1306_WHITE);
+  if (value == 2) { display.fillCircle(p[0][0], p[0][1], 2, SSD1306_WHITE); display.fillCircle(p[5][0], p[5][1], 2, SSD1306_WHITE); }
+  if (value == 3) { display.fillCircle(p[0][0], p[0][1], 2, SSD1306_WHITE); display.fillCircle(x + 15, y + 15, 2, SSD1306_WHITE); display.fillCircle(p[5][0], p[5][1], 2, SSD1306_WHITE); }
+  if (value == 4) { display.fillCircle(p[0][0], p[0][1], 2, SSD1306_WHITE); display.fillCircle(p[2][0], p[2][1], 2, SSD1306_WHITE); display.fillCircle(p[3][0], p[3][1], 2, SSD1306_WHITE); display.fillCircle(p[5][0], p[5][1], 2, SSD1306_WHITE); }
+  if (value == 5) { display.fillCircle(p[0][0], p[0][1], 2, SSD1306_WHITE); display.fillCircle(p[2][0], p[2][1], 2, SSD1306_WHITE); display.fillCircle(x + 15, y + 15, 2, SSD1306_WHITE); display.fillCircle(p[3][0], p[3][1], 2, SSD1306_WHITE); display.fillCircle(p[5][0], p[5][1], 2, SSD1306_WHITE); }
+  if (value == 6) { for (uint8_t i = 0; i < 6; i++) display.fillCircle(p[i][0], p[i][1], 2, SSD1306_WHITE); }
+}
+
+void drawDiceScreen() {
+  startFrame("DICE ROLLER");
+  drawDice(27, 15, diceA);
+  drawDice(71, 15, diceB);
+  centeredText("TOTAL: " + String(diceA + diceB), 45);
+  footer("TAP ROLL  HOLD BACK");
+  present();
+}
+
+void drawCounterScreen() {
+  startFrame("COUNTER", "SAVED");
+  String number = String((unsigned long)counterValue);
+  uint8_t size = number.length() <= 5 ? 2 : 1;
+  centeredText(number, 20, size);
+  centeredText("Tap to +1", 43);
+  footer("TAP +1  HOLD BACK");
+  present();
+}
+
+// ------------------------- PIXEL LAB / FACE --------------------------
+void drawPixelLab() {
+  startFrame("PIXEL LAB");
+  uint32_t f = animationFrame;
+  if (pixelMode == 0) {
+    for (int x = 4; x < 124; x += 4) {
+      int y = 30 + (int)(sin((x + f * 3) * 0.12f) * 13.0f);
+      display.drawPixel(x, y, SSD1306_WHITE);
+      if (x > 4) display.drawLine(x - 4, 30 + (int)(sin((x - 4 + f * 3) * 0.12f) * 13.0f), x, y, SSD1306_WHITE);
+    }
+  } else if (pixelMode == 1) {
+    for (uint8_t i = 0; i < 18; i++) {
+      int x = 6 + ((i * 19 + f * 3) % 116);
+      int y = 13 + ((i * 11 + f * 2) % 35);
+      display.fillRect(x, y, 2, 2, SSD1306_WHITE);
+    }
+  } else if (pixelMode == 2) {
+    int r = 3 + (f % 12);
+    display.drawCircle(64, 31, r, SSD1306_WHITE);
+    display.drawCircle(64, 31, r + 7, SSD1306_WHITE);
+    display.drawCircle(64, 31, r + 14, SSD1306_WHITE);
+  } else {
+    for (uint8_t i = 0; i < 16; i++) {
+      int h = 3 + ((i * 7 + f * 5) % 25);
+      display.fillRect(8 + i * 7, 49 - h, 4, h, SSD1306_WHITE);
+    }
+  }
+  display.setCursor(5, 12);
+  display.print("MODE "); display.print((unsigned)(pixelMode + 1)); display.print("/4");
+  footer("TAP MODE  HOLD BACK");
+  present();
+}
+
+void drawRobotFace() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(4, 1); display.print("READYBOT / FACE");
+  display.drawLine(3, 10, 124, 10, SSD1306_WHITE);
+
+  // blinkUntil is non-zero for a brief blink interval.
+  bool blinking = (millis() < blinkUntil);
+  if (blinking) {
+    display.drawLine(29, 29, 48, 29, SSD1306_WHITE);
+    display.drawLine(80, 29, 99, 29, SSD1306_WHITE);
+  } else {
+    int eyeH = (faceMood == 1) ? 4 : 9;
+    display.fillRoundRect(30, 22, 17, eyeH, 3, SSD1306_WHITE);
+    display.fillRoundRect(81, 22, 17, eyeH, 3, SSD1306_WHITE);
+    if (faceMood == 2) {
+      display.drawPixel(35, 25, SSD1306_BLACK); display.drawPixel(41, 25, SSD1306_BLACK);
+      display.drawPixel(86, 25, SSD1306_BLACK); display.drawPixel(92, 25, SSD1306_BLACK);
+    }
+  }
+  if (faceMood == 0) {
+    display.drawLine(51, 41, 77, 41, SSD1306_WHITE);
+    display.drawPixel(50, 40, SSD1306_WHITE); display.drawPixel(78, 40, SSD1306_WHITE);
+  } else if (faceMood == 1) {
+    display.drawLine(53, 43, 75, 43, SSD1306_WHITE);
+    display.drawPixel(57, 44, SSD1306_WHITE); display.drawPixel(71, 44, SSD1306_WHITE);
+  } else if (faceMood == 2) {
+    display.drawLine(52, 42, 58, 46, SSD1306_WHITE);
+    display.drawLine(58, 46, 70, 46, SSD1306_WHITE);
+    display.drawLine(70, 46, 76, 42, SSD1306_WHITE);
+  } else {
+    display.drawRoundRect(55, 38, 18, 10, 4, SSD1306_WHITE);
+  }
+  display.drawLine(3, 53, 124, 53, SSD1306_WHITE);
+  display.setCursor(4, 56); display.print("TAP MOOD  HOLD BACK");
+  present();
+}
+
+// ------------------------- SYSTEM / OLED TEST ------------------------
+void drawSystemInfo() {
+  startFrame("SYSTEM INFO", systemPage ? "2/2" : "1/2");
+  display.setCursor(5, 13);
+  if (systemPage == 0) {
+    display.print("Chip: "); display.println(ESP.getChipModel());
+    display.print("Rev:  "); display.println(ESP.getChipRevision());
+    display.print("CPU:  "); display.print(ESP.getCpuFreqMHz()); display.println(" MHz");
+    display.print("Flash:"); display.print(ESP.getFlashChipSize() / 1024UL); display.println(" KB");
+    display.print("Heap: "); display.print(ESP.getFreeHeap() / 1024UL); display.println(" KB free");
+  } else {
+    display.print("SDK: "); display.println(ESP.getSdkVersion());
+    display.print("Cores: "); display.println(ESP.getChipCores());
+    display.print("OLED: 128x64"); display.println();
+    display.print("I2C: 0x3C"); display.println();
+    display.print("WiFi: off idle"); display.println();
+  }
+  footer("TAP PAGE  HOLD BACK");
+  present();
+}
+
+void drawOledTest() {
+  startFrame("OLED TEST");
+  if (oledTestPattern == 0) {
+    display.drawRect(13, 15, 102, 34, SSD1306_WHITE);
+    display.drawLine(13, 15, 114, 48, SSD1306_WHITE);
+    display.drawLine(114, 15, 13, 48, SSD1306_WHITE);
+    display.drawCircle(64, 32, 10, SSD1306_WHITE);
+  } else if (oledTestPattern == 1) {
+    for (uint8_t y = 15; y < 50; y += 5) for (uint8_t x = 8; x < 122; x += 5) {
+      if (((x / 5) + (y / 5)) % 2 == 0) display.fillRect(x, y, 3, 3, SSD1306_WHITE);
+    }
+  } else if (oledTestPattern == 2) {
+    for (uint8_t y = 16; y < 51; y += 4) display.drawLine(7, y, 120, y, SSD1306_WHITE);
+  } else {
+    display.drawRoundRect(24, 17, 80, 30, 5, SSD1306_WHITE);
+    centeredText("128 x 64", 27, 1);
+    centeredText("PIXEL OK", 38, 1);
+  }
+  footer("TAP PATTERN  HOLD BACK");
+  present();
+}
+
+// ------------------------- SETTINGS / ABOUT ---------------------------
+const char *settingNames[] = {"Invert OLED", "Rotate 180", "Reset counter"};
+static const uint8_t SETTINGS_COUNT = 3;
+
+void drawSettings() {
+  startFrame("SETTINGS", String(settingsIndex + 1) + "/3");
+  for (uint8_t i = 0; i < SETTINGS_COUNT; i++) {
+    int y = 15 + i * 12;
+    if (i == settingsIndex) {
+      display.fillRoundRect(5, y - 1, 118, 11, 2, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+    } else {
+      display.setTextColor(SSD1306_WHITE);
+    }
+    display.setCursor(9, y + 1);
+    display.print(settingNames[i]);
+    display.setCursor(101, y + 1);
+    if (i == 0) display.print(invertMode ? "ON" : "OFF");
+    if (i == 1) display.print(rotateMode ? "ON" : "OFF");
+    if (i == 2) display.print("GO");
+  }
+  display.setTextColor(SSD1306_WHITE);
+  footer("TAP MOVE  HOLD APPLY");
+  present();
+}
+
+void applySetting() {
+  if (settingsIndex == 0) {
+    invertMode = !invertMode;
+    prefs.putBool("invert", invertMode);
+    display.invertDisplay(invertMode);
+  } else if (settingsIndex == 1) {
+    rotateMode = !rotateMode;
+    prefs.putBool("rotate", rotateMode);
+    applyDisplaySettings();
+  } else {
+    counterValue = 0;
+    counterDirty = true;
+    saveCounter();
+  }
+  drawSettings();
+}
+
+void drawAbout() {
+  startFrame("ABOUT READYBOT");
+  centeredText("READYBOT MINI", 15);
+  centeredText("Bruce-inspired UI", 26);
+  centeredText("ESP32-C3 + SSD1306", 37);
+  centeredText("No clock / no battery", 44);
+  footer("OPEN SOURCE PROJECT");
+  present();
+}
+
+// ------------------------- OPEN / BUTTON EVENTS -----------------------
+void openSelectedMenu() {
+  currentScreen = menuItems[menuIndex].screen;
+  switch (currentScreen) {
+    case SCR_WIFI_LIST: runWiFiScan(false); break;
+    case SCR_BLE_LIST: runBLEScan(); break;
+    case SCR_CHANNEL_MAP: runWiFiScan(true); break;
+    case SCR_REACTION: reactionState = REACT_READY; drawReaction(); break;
+    case SCR_DICE:
+      diceA = 1 + (esp_random() % 6); diceB = 1 + (esp_random() % 6);
+      drawDiceScreen(); break;
+    case SCR_COUNTER: drawCounterScreen(); break;
+    case SCR_PIXEL_LAB: lastAnimationAt = 0; drawPixelLab(); break;
+    case SCR_FACE:
+      nextBlinkAt = millis() + 1800 + (esp_random() % 2600); blinkUntil = 0; drawRobotFace(); break;
+    case SCR_SYSTEM: systemPage = 0; drawSystemInfo(); break;
+    case SCR_OLED_TEST: oledTestPattern = 0; drawOledTest(); break;
+    case SCR_SETTINGS: settingsIndex = 0; drawSettings(); break;
+    case SCR_ABOUT: drawAbout(); break;
+    default: goHome(); break;
+  }
+}
+
+void handleShortPress() {
+  switch (currentScreen) {
+    case SCR_HOME:
+      menuIndex = (menuIndex + 1) % MENU_COUNT;
+      drawHome();
+      break;
+    case SCR_WIFI_LIST:
+      if (wifiCount == 0) runWiFiScan(false);
+      else { wifiSelected = (wifiSelected + 1) % wifiCount; drawWiFiDetails(); }
+      break;
+    case SCR_BLE_LIST:
+      if (bleCount == 0) runBLEScan();
+      else { bleSelected = (bleSelected + 1) % bleCount; drawBLEDetails(); }
+      break;
+    case SCR_CHANNEL_MAP: runWiFiScan(true); break;
+    case SCR_REACTION: handleReactionTap(); break;
+    case SCR_DICE:
+      diceA = 1 + (esp_random() % 6); diceB = 1 + (esp_random() % 6); drawDiceScreen(); break;
+    case SCR_COUNTER:
+      counterValue++;
+      counterDirty = true;
+      // Save each increment to make the counter survive an unexpected shutdown.
+      saveCounter();
+      drawCounterScreen();
+      break;
+    case SCR_PIXEL_LAB: pixelMode = (pixelMode + 1) % 4; drawPixelLab(); break;
+    case SCR_FACE: faceMood = (faceMood + 1) % 4; drawRobotFace(); break;
+    case SCR_SYSTEM: systemPage = (systemPage + 1) % 2; drawSystemInfo(); break;
+    case SCR_OLED_TEST: oledTestPattern = (oledTestPattern + 1) % 4; drawOledTest(); break;
+    case SCR_SETTINGS: settingsIndex = (settingsIndex + 1) % SETTINGS_COUNT; drawSettings(); break;
+    case SCR_ABOUT: goHome(); break;
+  }
+}
+
+void handleHoldPress(uint32_t duration) {
+  if (currentScreen == SCR_HOME) {
+    openSelectedMenu();
+    return;
+  }
+  if (currentScreen == SCR_SETTINGS) {
+    if (duration >= VERY_LONG_HOLD_MS) goHome();
+    else applySetting();
+    return;
+  }
+  // A very long hold is an unambiguous BACK gesture inside every tool.
+  // A normal hold also goes back to keep one-button operation easy.
+  goHome();
+}
+
+void pollButton() {
+  bool down = (digitalRead(BUTTON_PIN) == LOW);
+  uint32_t now = millis();
+  if (down != buttonWasDown && now - buttonChangedAt >= DEBOUNCE_MS) {
+    buttonChangedAt = now;
+    buttonWasDown = down;
+    if (down) {
+      buttonDownAt = now;
+    } else {
+      uint32_t held = now - buttonDownAt;
+      if (held < HOLD_MS) handleShortPress();
+      else handleHoldPress(held);
+    }
+  }
+}
+
+// ------------------------- STARTUP / MAIN LOOP ------------------------
+// Launcher-style startup: animated boot progress, a start prompt, and an
+// automatic launch after a short timeout (similar to M5Launcher behaviour).
+// A tap on GPIO1 skips the timeout and opens the ReadyBot interface.
+void drawBootScreen(uint8_t progress, bool waiting, uint8_t secondsLeft = 0) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // Clean monochrome launcher frame.
+  display.drawRoundRect(2, 2, 124, 60, 5, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(8, 6);
+  display.print("READYBOT");
+  display.setCursor(98, 6);
+  display.print("v1.0");
+  display.drawLine(7, 16, 120, 16, SSD1306_WHITE);
+
+  // Small original RB emblem, built from OLED primitives (no bitmap needed).
+  display.drawRoundRect(10, 22, 29, 26, 5, SSD1306_WHITE);
+  display.drawLine(16, 28, 23, 28, SSD1306_WHITE);
+  display.drawLine(16, 28, 16, 41, SSD1306_WHITE);
+  display.drawLine(16, 34, 23, 34, SSD1306_WHITE);
+  display.drawLine(23, 28, 25, 30, SSD1306_WHITE);
+  display.drawLine(25, 30, 23, 34, SSD1306_WHITE);
+  display.drawLine(23, 34, 26, 38, SSD1306_WHITE);
+  display.drawLine(26, 38, 23, 41, SSD1306_WHITE);
+  display.drawLine(23, 41, 16, 41, SSD1306_WHITE);
+
+  display.setCursor(45, 25);
+  display.print("MINI LAUNCHER");
+  display.setCursor(45, 37);
+  display.print(waiting ? "PRESS TO OPEN" : "BOOT CHECK...");
+
+  // A progress bar animates during boot and counts down while waiting.
+  display.drawRoundRect(8, 48, 112, 5, 2, SSD1306_WHITE);
+  uint8_t fillWidth = (uint16_t)108 * progress / 100;
+  if (fillWidth > 0) display.fillRect(10, 50, fillWidth, 1, SSD1306_WHITE);
+
+  display.setCursor(8, 54);
+  if (waiting) {
+    display.print("AUTO START IN ");
+    display.print(secondsLeft);
+    display.print("s");
+  } else {
+    display.print("INITIALIZING...");
+  }
+  present();
+}
+
+void runBootSequence() {
+  // Animated boot progress, deliberately short so the device remains snappy.
+  for (uint8_t progress = 0; progress <= 100; progress += 5) {
+    drawBootScreen(progress, false);
+    delay(35);
+  }
+
+  // M5Launcher-like start screen: tap to enter immediately, otherwise auto-run.
+  const uint32_t AUTO_START_MS = 5000;
+  const uint32_t startedAt = millis();
+  uint32_t lastDrawAt = 0;
+  bool buttonPressed = false;
+
+  while (millis() - startedAt < AUTO_START_MS) {
+    uint32_t now = millis();
+    uint32_t elapsed = now - startedAt;
+
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      delay(30); // debounce for the boot prompt
+      if (digitalRead(BUTTON_PIN) == LOW) {
+        buttonPressed = true;
+        while (digitalRead(BUTTON_PIN) == LOW) delay(5); // wait for release
+        break;
+      }
+    }
+
+    if (now - lastDrawAt >= 100) {
+      uint8_t remaining = (uint8_t)((AUTO_START_MS - elapsed + 999) / 1000);
+      uint8_t progress = (uint8_t)(100 - ((uint64_t)elapsed * 100 / AUTO_START_MS));
+      drawBootScreen(progress, true, remaining);
+      lastDrawAt = now;
+    }
+    delay(3);
+  }
+
+  (void)buttonPressed; // either a tap or timeout continues into ReadyBot
+  display.clearDisplay();
+  display.drawRoundRect(7, 11, 114, 42, 5, SSD1306_WHITE);
+  centeredText("READYBOT", 20, 2);
+  centeredText("STARTING...", 40, 1);
+  present();
+  delay(280);
+
+  // Do not let a boot-screen press leak into the normal button state machine.
+  buttonWasDown = false;
+  buttonEventPending = false;
+  buttonChangedAt = millis();
+}
+
+void setup() {
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  Serial.begin(115200);
+  Wire.begin(OLED_SDA, OLED_SCL);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    // The display is needed for the interface; provide a serial diagnostic.
+    Serial.println("READYBOT: SSD1306 not found at I2C 0x3C. Check SDA=9, SCL=10, VCC, GND.");
+    while (true) delay(1000);
+  }
+
+  prefs.begin("readybot", false);
+  counterValue = prefs.getUInt("counter", 0);
+  invertMode = prefs.getBool("invert", false);
+  rotateMode = prefs.getBool("rotate", false);
+  applyDisplaySettings();
+
+  // Radio modules are deliberately off at boot.
+  WiFi.mode(WIFI_OFF);
+  randomSeed(esp_random());
+  runBootSequence();
+  currentScreen = SCR_HOME;
+  drawHome();
+  Serial.println("READYBOT ready. Button GPIO1: tap=next/action, hold=select/back.");
+}
+
+void loop() {
+  pollButton();
+  uint32_t now = millis();
+
+  if (currentScreen == SCR_REACTION && reactionState == REACT_WAITING && now - reactionStartedAt >= reactionDelay) {
+    reactionState = REACT_GO;
+    drawReaction();
+  }
+
+  if (currentScreen == SCR_PIXEL_LAB && now - lastAnimationAt >= 90) {
+    lastAnimationAt = now;
+    animationFrame++;
+    drawPixelLab();
+  }
+
+  if (currentScreen == SCR_FACE) {
+    if (now >= nextBlinkAt && now >= blinkUntil) {
+      blinkUntil = now + 130;
+      nextBlinkAt = now + 1900 + (esp_random() % 3000);
+      drawRobotFace();
+    } else if (blinkUntil && now >= blinkUntil) {
+      blinkUntil = 0;
+      drawRobotFace();
+    }
+  }
+
+  delay(4);
+}
