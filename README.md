@@ -78,7 +78,5 @@ Development — In Progress
 
 Open-source project. License will be specified later.
 
-Made with ❤️ and ESP32-C3.
-
-ReadyBot — Small device, big possibilities.
+На фото изображена схема подключения компонентов которые нужны
 <img width="927" height="513" alt="image" src="https://github.com/user-attachments/assets/822c6dee-4eb6-4663-9a7c-bf197b1f0b79" />
