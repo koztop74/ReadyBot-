@@ -24,73 +24,42 @@ ReadyBot — компактный многофункциональный пор�
 🌸 Startup Animation — собственная загрузочная анимация READYBOT.
 
 🔧 Hardware
-
 Основные компоненты проекта:
-
 Компонент
-
 Модель
-
 Микроконтроллер
-
 ESP32-C3 Super Mini
-
 Дисплей
-
 OLED 128×64
-
 Интерфейс
-
 I2C
-
 Управление
-
 1 кнопка
-
 Питание
-
 Li-ion аккумулятор
-
 Подключение дисплея
 
 OLED
-
 ESP32-C3
-
 SDA
-
 GPIO 9
-
 SCL
-
 GPIO 10
-
 VCC
-
 3.3V
-
 GND
-
 GND
 
 Кнопка подключается к GPIO 1 и GND.
 
 💻 Software
-
 Arduino IDE 1.8.19
-
 ESP32 Arduino Core
-
 Adafruit SSD1306
-
 Adafruit GFX
-
 WiFi
-
 WebServer
-
 Preferences
-
 BLE
 
 🎯 Цели проекта
